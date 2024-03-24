@@ -1,0 +1,483 @@
+---
+title: "Calculating co-national and co-ethnic concentration"
+---
+
+# The code for harmonising LSOA geographies across the 2011 and 2021 Census was taken from https://profrichharris.github.io/census/harmonised/#creating-census-counts-for-the-pseudo-oas
+
+# Install and library packages
+```{r}
+library(data.table)
+library(tidyverse)
+library(RANN)
+```
+
+# Set rootpaths
+```{r}
+ghp = "path/to/repository/2011-2021-LSOA-Co-national-and-Co-ethnic-Concentration/"
+dp  = "data/"
+lkp = "lookups/"
+c11 = "census/2011/"
+c21 = "census/2021/"
+otp = "outputs/"
+plp = "preliminary/"
+```
+
+# Import and merge data
+```{r}
+# Lookup tables taken from https://geoportal.statistics.gov.uk/datasets/ons::lower-layer-super-output-area-2001-to-lower-layer-super-output-area-2011-to-local-authority-district-2011-lookup-in-england-and-wales-1/explore and  https://geoportal.statistics.gov.uk/datasets/ons::lsoa-2011-to-lsoa-2021-to-local-authority-district-2022-lookup-for-england-and-wales/explore
+df = read_csv(paste0(ghp,dp,lkp,"2001 LSOA 2011 LSOA 2011 LAD.csv")) %>% 
+  rename(CHG11 = CHGIND) %>% select(c(1:7)) %>% as_tibble() %>%
+  full_join(read_csv(paste0(ghp,dp,lkp,"2011 LSOA 2021 LSOA 2021 LAD.csv")) %>% 
+            rename(CHG21 = CHGIND, LSOA11CD = F_LSOA11CD) %>% select(c(1,3:7)) %>% as_tibble(), by = "LSOA11CD") %>% 
+  mutate(CHG21 = ifelse(CHG21 == "x", "X", CHG21))
+```
+
+# Define merged LSOA variable
+```{r}
+output = df %>% 
+  mutate(LSOAXXCD = NA) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "U" & CHG21 == "U", LSOA21CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "M" & CHG21 == "U", LSOA21CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "S" & CHG21 == "U", LSOA01CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "U" & CHG21 == "M", LSOA21CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "U" & CHG21 == "S", LSOA11CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "S" & CHG21 == "S", LSOA01CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "M" & CHG21 == "M", LSOA21CD, LSOAXXCD)) %>% 
+  mutate(LSOAXXCD = ifelse(CHG11 == "M" & CHG21 == "S", LSOA11CD, LSOAXXCD))
+```
+
+# Assess quality of merge
+```{r}
+# Check which LSOAs haven't merged
+output %>% filter(is.na(LSOAXXCD))
+# Check how they break down by merge type
+output %>% 
+  filter(is.na(LSOAXXCD)) %>% 
+  select(CHG11, CHG21) %>% 
+  group_by(CHG11, CHG21) %>% 
+  summarise(n = n()) %>% 
+  print(n = Inf)
+```
+
+# Assign missing 2001-2011 LSOA lookups using nearest neighbour
+```{r}
+# Import 2001 weighted population centroids
+pts01 = read_csv(paste0(ghp,dp,lkp,"2001 Pop Centroid.csv")) %>% 
+  select(X, Y, lsoa01cd) %>% 
+  rename(LSOA01CD = lsoa01cd)
+# Import 2011 weighted population centroids and filter for those with no 2001-2011 lookup
+pts11 = read_csv(paste0(ghp,dp,lkp,"2011 Pop Centroid.csv")) %>% 
+  rename(LSOA11CD = lsoa11cd) %>% 
+  semi_join(output %>% filter(is.na(LSOA01CD)), by = "LSOA11CD") %>% 
+  select(X, Y, LSOA11CD)
+# Use lat and long coordinated to assign nearest 2011 LSOA based on distance between centroids
+i = nn2(data  = pts01 %>% select(-LSOA01CD),
+         query = pts11 %>% select(-LSOA11CD),
+         k = 1)$nn.idx[,1]
+# Assign these new 2011 LSOAs to the lookup table
+output = left_join(output,
+          data.frame(LSOA11CD = pts11$LSOA11CD, nearest = pts01$LSOA01CD[i]),
+          by = "LSOA11CD") %>% 
+  mutate(LSOA01CD = ifelse(!is.na(nearest), nearest, LSOA01CD)) %>% 
+  select(-nearest)
+# Check these geographies have now been assigned LSOAs for all 3 censuses
+output %>% 
+  filter(is.na(CHG11)) %>% 
+  select(LSOA01CD, LSOA11CD, LSOA21CD, CHG11, LSOAXXCD)
+```
+
+# While loop that identifies inteconnected clusters of LSOAs that have been connected with each other through at least 1 census
+# That is, if a set of LSOAs have been merged or split or fragmented in some way over time, then they are all connected. 
+# This while loop is designed to track down those connections and ensure all the connected LSOAs are assigned the same code
+```{r}
+# While there are harmonised LSOAs with no assigned code
+while(nrow(output %>% filter(is.na(LSOAXXCD))) > 0) {
+  
+  # LSOA currently at the top of the filtered dataframe of LSOAs with unassigned harmonised codes
+  output %>% 
+    filter(is.na(LSOAXXCD)) %>% 
+    .[1,] -> found
+  
+  # Assign n as current list of LSOAs associated with the LSOA with no assigned harmonised code 
+  # (this will always be 1 I believe)
+  n = nrow(found)
+  # Assign n.previous to 0 so at least 1 search is done
+  n.previous = 0
+  
+  # While loop that checks for all potential connections to the current known list of
+  # LSOAs associated with unassigned LSOA. It keeps looking for connections until none
+  # are found to any in the cluster.
+  # Initial check is whether the current number of found LSOAs is greater than the previous
+  # check - i.e. were any new connections found last pass.
+  # The default answer to this is yes on the first pass as the unassigned LSOA is in found
+  # and n.previous has been set to 0.
+  while(n > n.previous) {
+    
+    # Set n.previous to be the current known number of associated LSOAs.
+    # Given the code is on a new pass, this is now the number of found 
+    # LSOAs from the previous pass.
+    n.previous = n
+    # Create temporary dataframe 'search' from found.
+    # I guess this allows found to be redefined while still using the variables in it within the pipe?
+    search = found
+    
+    # Search for any new LSOAs with any connection to any of the current group across any of the censuses.
+    output %>% 
+      filter( LSOA01CD %in% search$LSOA01CD |
+              LSOA11CD %in% search$LSOA11CD |
+              LSOA21CD %in% search$LSOA21CD ) -> found
+    
+    # Update n to be the new number of LSOAs identified as being connected to the unassigned LSOA
+    n = nrow(found)
+    
+  }
+  
+  # Having found all the LSOAs connected to the unassigned LSOA across any of the censuses, 
+  # Assign this entire group the 2021 LSOA code (not sure why the 2021 code is used).
+  output %>% 
+    mutate(LSOAXXCD = ifelse( LSOA01CD %in% found$LSOA01CD |
+                              LSOA11CD %in% found$LSOA11CD |
+                              LSOA21CD %in% found$LSOA21CD,
+                              found$LSOA21CD[1],
+                              LSOAXXCD)) -> output
+}
+```
+
+# Recode harmonised variable so it's not simply an amalgamation of the other codes
+```{r}
+# Rearrange by 2021 LSOA census codes
+output %>% 
+  arrange(LSOA01CD) -> output
+# Create single column dataframe of unique harmonised codes
+output %>% 
+  select(LSOAXXCD) %>% 
+  filter(!duplicated(LSOAXXCD)) -> gps
+# Assign each one a unique row ID
+data.frame(LSOAXXCD = gps$LSOAXXCD, i = 1:nrow(gps)) -> gps
+# Create new unique code for each harmonised LSOA and used to rename LSOAXXCD column
+output %>% 
+  left_join(gps, by = "LSOAXXCD") %>% 
+  mutate(i = str_pad(i, width = 7, pad = "0")) %>% 
+  mutate(LSOAXXCD = paste0("X", i, substr(LSOAXXCD, 1, 1))) %>% 
+  select(-i) -> output
+# Remove the synthetic 2001 LSOA codes for those geographies for which it was not originally assigned
+#output %>% 
+#  mutate(LSOA01CD = ifelse(is.na(CHG11), NA, LSOA01CD)) -> output
+```
+
+# Add higher-level geographies
+```{r}
+# Merge output geographies with travel-to-work areas and countries, taken from https://geoportal.statistics.gov.uk/datasets/ons::lower-layer-super-output-area-2011-to-travel-to-work-area-december-2011-lookup-in-the-united-kingdom-1/explore
+# and countries, taken from https://geoportal.statistics.gov.uk/datasets/ons::local-authority-district-to-country-december-2022-lookup-in-the-united-kingdom/explore
+output %>%
+  left_join(read_csv(paste0(ghp,dp,lkp,"2011 LSOA 2011 TTWA.csv"  )) %>% select(c(1,3:4)) %>% as.tibble(), by = "LSOA11CD") %>% 
+  left_join(read_csv(paste0(ghp,dp,lkp,"2022 LAD 2022 Country.csv")) %>% select(c(1,3:4)) %>% as.tibble(), by = "LAD22CD" ) -> output
+```
+
+# Save lookup table
+```{r}
+output %>% 
+  select(LSOAXXCD, LSOA01CD, LSOA01NM, LSOA11CD, LSOA11NM, LSOA21CD, LSOA21NM, TTWA11CD, TTWA11NM, CTRY22CD, CTRY22NM) %>% 
+  unique(na.rm = TRUE) %>% 
+  arrange(LSOA01CD) %>% 
+  write_csv(paste0(ghp,dp,lkp,"LSOAXXCD_lookup.csv"))
+```
+
+
+
+# Calculate co-national and co-ethnic concentration for 2021 Census populations
+```{r}
+# All 2021 Census data taken from https://www.nomisweb.co.uk/sources/census_2021_bulk
+
+# import lookup table
+lsoa_ctry_lkp = read_csv(paste0(ghp,dp,lkp,"LSOAXXCD_lookup.csv")) %>% as_tibble() %>% 
+                select(LSOA11CD,CTRY22NM) %>% group_by(LSOA11CD) %>% summarise(CTRY22NM = unique(CTRY22NM))
+
+# Number of usual residents in households and communal establishments
+pop_2011 = read.csv(paste0(ghp,dp,c11,"KS101EW - Usual resident population/36453651724329047.csv"), skip = 8) %>%
+           .[1:(nrow(.)-4),] %>% 
+           mutate(LSOA11CD = X2011.super.output.area...lower.layer %>% substr(1,9),
+                  pop_ttl_2011 = as.numeric(All.usual.residents)) %>% 
+           select(LSOA11CD,pop_ttl_2011)
+
+# Country of birth
+cob_2011 = read.csv(paste0(ghp,dp,c11,"QS203EW - Country of birth (detailed)/36457221200498554.csv"), skip = 7) %>% 
+           .[1:(nrow(.)-4),] %>% 
+           mutate(LSOA11CD = X2011.super.output.area...lower.layer %>% substr(1,9),
+                  ttl                    = All.categories..Country.of.birth,
+                  cob_UK_2011            = Europe..United.Kingdom..Total + 
+                                           Europe..Guernsey + Europe..Jersey + 
+                                           Europe..Channel.Islands.not.otherwise.specified + 
+                                           Europe..Isle.of.Man,
+                  cob_Eur_2011           = Europe..Other.Europe..EU.countries..Member.countries.in.March.2001..Total + 
+                                           Europe..Ireland + 
+                                           Europe..Other.Europe..EU.countries..Accession.countries.April.2001.to.March.2011..Total + 
+                                           Europe..Other.Europe..Rest.of.Europe..Total,
+                  cob_Africa_2011        = Africa..Total,
+                  cob_Mid_East_Asia_2011 = Middle.East.and.Asia..Total,
+                  cob_Amrs_Carib_2011    = The.Americas.and.the.Caribbean..Total,
+                  cob_Ant_Ocna_Oth_2011  = Antarctica.and.Oceania..Total + Other) %>% 
+           select(LSOA11CD, ttl, cob_UK_2011, cob_Eur_2011, 
+                  cob_Africa_2011, cob_Mid_East_Asia_2011, cob_Amrs_Carib_2011, cob_Ant_Ocna_Oth_2011) %>% 
+           as.tibble() %>% left_join(lsoa_ctry_lkp) %>% filter(CTRY22NM == "England") %>% 
+           mutate(cob_UK_2011_p            = (cob_UK_2011           /sum(cob_UK_2011           )),
+                  cob_Eur_2011_p           = (cob_Eur_2011          /sum(cob_Eur_2011          )),
+                  cob_Africa_2011_p        = (cob_Africa_2011       /sum(cob_Africa_2011       )),
+                  cob_Mid_East_Asia_2011_p = (cob_Mid_East_Asia_2011/sum(cob_Mid_East_Asia_2011)),
+                  cob_Amrs_Carib_2011_p    = (cob_Amrs_Carib_2011   /sum(cob_Amrs_Carib_2011   )),
+                  cob_Ant_Ocna_Oth_2011_p  = (cob_Ant_Ocna_Oth_2011 /sum(cob_Ant_Ocna_Oth_2011 ))) %>% 
+           select(LSOA11CD, cob_UK_2011_p, cob_Eur_2011_p, cob_Africa_2011_p, 
+                  cob_Mid_East_Asia_2011_p, cob_Amrs_Carib_2011_p, cob_Ant_Ocna_Oth_2011_p) %>%
+           setNames(c("LSOA11CD","cob_ukb_2011", "cob_eur_2011","cob_afr_2011","cob_mea_2011","cob_anc_2011","cob_aoo_2011"))
+cob_all_2011 = c(cob_2011$cob_ukb_2011,cob_2011$cob_eur_2011,cob_2011$cob_afr_2011,
+                 cob_2011$cob_mea_2011,cob_2011$cob_anc_2011,cob_2011$cob_aoo_2011)
+cob_2011 = cob_2011 %>%
+           mutate(cob_ukb_2011 = cob_ukb_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )},
+                  cob_eur_2011 = cob_eur_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )},
+                  cob_afr_2011 = cob_afr_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )},
+                  cob_mea_2011 = cob_mea_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )},
+                  cob_anc_2011 = cob_anc_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )},
+                  cob_aoo_2011 = cob_aoo_2011 %>% {(. - mean(cob_all_2011 )) / sd(cob_all_2011 )})
+
+# Ethnic group
+etg_2011 = read.csv(paste0(ghp,dp,c11,"QS201EW - Ethnic group/2430761413876469.csv"), skip = 7) %>%
+           .[1:(nrow(.)-4),] %>% 
+           mutate(LSOA11CD = X2011.super.output.area...lower.layer %>% substr(1,9),
+                  ttl = as.numeric(All.categories..Ethnic.group)) %>% 
+           select(LSOA11CD, ttl, White, 
+                  Asian.Asian.British..Indian,
+                  Asian.Asian.British..Pakistani,
+                  Asian.Asian.British..Bangladeshi,
+                  Asian.Asian.British..Chinese,
+                  Asian.Asian.British..Other.Asian,
+                  Black, Other.ethnic.group..Arab,
+                  Mixed, Other.ethnic.group..Any.other.ethnic.group) %>% 
+           setNames(c("LSOA11CD", "ttl", "white", "indian", "pakistani", "bangladeshi", 
+                      "chinese", "other_asian", "afr_carib_oth", "arabic", "mixed", "other_group")) %>% 
+           mutate(p_and_b   = pakistani + bangladeshi, 
+                  oth_asian = chinese + other_asian,
+                  other     = arabic  + other_group) %>% 
+           select(LSOA11CD, ttl, white, indian, p_and_b, afr_carib_oth, oth_asian, mixed, other) %>% 
+           as.tibble() %>% left_join(lsoa_ctry_lkp) %>% filter(CTRY22NM == "England") %>%
+           mutate(white_p         = (white        /sum(white        )),
+                  indian_p        = (indian       /sum(indian       )),
+                  p_and_b_p       = (p_and_b      /sum(p_and_b      )),
+                  afr_carib_oth_p = (afr_carib_oth/sum(afr_carib_oth)),
+                  oth_asian_p     = (oth_asian    /sum(oth_asian    )),
+                  mixed_p         = (mixed        /sum(mixed        )),
+                  other_p         = (other        /sum(other        ))) %>% 
+           select(LSOA11CD, white_p, indian_p, p_and_b_p, afr_carib_oth_p, oth_asian_p, mixed_p , other_p) %>%
+           setNames(c("LSOA11CD",     "etg_wht_2011", "etg_ind_2011", "etg_pnb_2011", 
+                      "etg_aco_2011", "etg_oas_2011", "etg_mxd_2011", "etg_otr_2011"))
+etg_all_2011 = c(etg_2011$etg_wht_2011,etg_2011$etg_ind_2011,etg_2011$etg_pnb_2011,etg_2011$etg_aco_2011,
+                 etg_2011$etg_oas_2011,etg_2011$etg_mxd_2011,etg_2011$etg_otr_2011)
+etg_2011 = etg_2011 %>%
+           mutate(etg_wht_2011 = etg_wht_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_ind_2011 = etg_ind_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_pnb_2011 = etg_pnb_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_aco_2011 = etg_aco_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_oas_2011 = etg_oas_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_mxd_2011 = etg_mxd_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )},
+                  etg_otr_2011 = etg_otr_2011 %>% {(. - mean(etg_all_2011 )) / sd(etg_all_2011 )})
+```
+
+
+
+# Calculate co-national and co-ethnic concentration for 2021 Census populations
+```{r}
+# All 2021 Census data taken from https://www.nomisweb.co.uk/sources/census_2021_bulk
+
+# Define function to get the weighted average age for each age band at the national level (gma = get mean age)
+gma = function(df,lwr,upr) {
+  df[2,(lwr+3):(upr+3)] %>% t() %>% data.frame(age = lwr:upr, n = .) %>% group_split(age) %>% map(~ rep(.$age,.$n)) %>% unlist() %>% mean()
+}
+
+# import lookup table
+lsoa_ctry_lkp = read_csv(paste0(ghp,dp,lkp,"LSOAXXCD_lookup.csv")) %>% as_tibble() %>% 
+                select(LSOA21CD,CTRY22NM) %>% group_by(LSOA21CD) %>% summarise(CTRY22NM = unique(CTRY22NM))
+
+# Number of usual residents in households and communal establishments
+pop_2021 = read_csv(paste0(ghp,dp,c21,"census2021-ts001/census2021-ts001-lsoa.csv")) %>% 
+           select(`geography code`,`Residence type: Total; measures: Value`) %>%
+           setNames(c("LSOA21CD","pop_ttl_2021"))
+
+# Country of birth
+cob_2021 = read_csv(paste0(ghp,dp,c21,"census2021-ts004/census2021-ts004-lsoa.csv")) %>% 
+           select(c(`geography code`,
+                    `Country of birth: Total; measures: Value`,
+                    `Country of birth: Europe: United Kingdom; measures: Value`,
+                    `Country of birth: Europe: EU countries: European Union EU14; measures: Value`,
+                    `Country of birth: Europe: EU countries: European Union EU8; measures: Value`,
+                    `Country of birth: Europe: EU countries: European Union EU2; measures: Value`,
+                    `Country of birth: Europe: EU countries: All other EU countries; measures: Value`,
+                    `Country of birth: Europe: Non-EU countries; measures: Value`,
+                    `Country of birth: Africa; measures: Value`,
+                    `Country of birth: Middle East and Asia; measures: Value`,
+                    `Country of birth: The Americas and the Caribbean; measures: Value`,
+                    `Country of birth: Antarctica and Oceania (including Australasia) and Other; measures: Value`,
+                    `Country of birth: British Overseas ; measures: Value`)) %>% 
+           setNames(c("LSOA21CD","cob_ttl_2021","cob_UK_2021",
+                      "cob_EU14_2021","cob_EU8_2021","cob_EU2_2021","cob_EU_other_2021","cob_Eur_non_EU_2021",
+                      "cob_Africa_2021","cob_Mid_East_Asia_2021","cob_Amrs_Carib_2021","cob_Ant_Ocna_Oth_2021","cob_brt_ovs_2021")) %>%
+           mutate(cob_UK_2021      = cob_UK_2021 + cob_brt_ovs_2021,
+                  cob_Eur_2021     = cob_EU14_2021 + cob_EU8_2021 + cob_EU2_2021 + cob_EU_other_2021 + cob_Eur_non_EU_2021) %>% 
+           as.tibble() %>% left_join(lsoa_ctry_lkp) %>% filter(CTRY22NM == "England") %>% 
+           mutate(cob_UK_2021_p            = (cob_UK_2021           /sum(cob_UK_2021           )),
+                  cob_Eur_2021_p           = (cob_Eur_2021          /sum(cob_Eur_2021          )),
+                  cob_Africa_2021_p        = (cob_Africa_2021       /sum(cob_Africa_2021       )),
+                  cob_Mid_East_Asia_2021_p = (cob_Mid_East_Asia_2021/sum(cob_Mid_East_Asia_2021)),
+                  cob_Amrs_Carib_2021_p    = (cob_Amrs_Carib_2021   /sum(cob_Amrs_Carib_2021   )),
+                  cob_Ant_Ocna_Oth_2021_p  = (cob_Ant_Ocna_Oth_2021 /sum(cob_Ant_Ocna_Oth_2021 ))) %>% 
+            select(LSOA21CD, cob_UK_2021_p, cob_Eur_2021_p, 
+                   cob_Africa_2021_p, cob_Mid_East_Asia_2021_p, cob_Amrs_Carib_2021_p, cob_Ant_Ocna_Oth_2021_p) %>%
+           setNames(c("LSOA21CD","cob_ukb_2021", "cob_eur_2021","cob_afr_2021","cob_mea_2021","cob_anc_2021","cob_aoo_2021"))
+cob_all_2021 = c(cob_2021$cob_ukb_2021,cob_2021$cob_eur_2021,cob_2021$cob_afr_2021,
+                 cob_2021$cob_mea_2021,cob_2021$cob_anc_2021,cob_2021$cob_aoo_2021)
+cob_2021 = cob_2021 %>%
+           mutate(cob_ukb_2021 = cob_ukb_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )},
+                  cob_eur_2021 = cob_eur_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )},
+                  cob_afr_2021 = cob_afr_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )},
+                  cob_mea_2021 = cob_mea_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )},
+                  cob_anc_2021 = cob_anc_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )},
+                  cob_aoo_2021 = cob_aoo_2021 %>% {(. - mean(cob_all_2021 )) / sd(cob_all_2021 )})
+
+# Ethnic group
+etg_2021 = read_csv(paste0(ghp,dp,c21,"census2021-ts021/census2021-ts021-lsoa.csv")) %>% 
+           select(c(`geography code`,
+                    `Ethnic group: White`,
+                    `Ethnic group: Asian, Asian British or Asian Welsh: Indian`,
+                    `Ethnic group: Asian, Asian British or Asian Welsh: Pakistani`,
+                    `Ethnic group: Asian, Asian British or Asian Welsh: Bangladeshi`,
+                    `Ethnic group: Black, Black British, Black Welsh, Caribbean or African`,
+                    `Ethnic group: Other ethnic group: Arab`,
+                    `Ethnic group: Asian, Asian British or Asian Welsh: Chinese`,
+                    `Ethnic group: Asian, Asian British or Asian Welsh: Other Asian`,
+                    `Ethnic group: Mixed or Multiple ethnic groups`,
+                    `Ethnic group: Other ethnic group: Any other ethnic group`)) %>% 
+           setNames(c("LSOA21CD", "white", "indian", "pakistani", "bangladeshi", 
+                      "afr_crb_oth", "arabic", "chinese", "other_asian", "mixed", "other_group")) %>% 
+           mutate(p_and_b   = pakistani + bangladeshi,
+                  oth_asian = chinese + other_asian,
+                  other     = arabic + other_group) %>% 
+           select(c("LSOA21CD", "white", "indian", "p_and_b", "afr_crb_oth", "oth_asian", "mixed", "other")) %>% 
+           as.tibble() %>% left_join(lsoa_ctry_lkp) %>% filter(CTRY22NM == "England") %>%
+           mutate(white_p       = (white      /sum(white      )),
+                  indian_p      = (indian     /sum(indian     )),
+                  p_and_b_p     = (p_and_b    /sum(p_and_b    )),
+                  afr_crb_oth_p = (afr_crb_oth/sum(afr_crb_oth)),
+                  oth_asian_p   = (oth_asian  /sum(oth_asian  )),
+                  mixed_p       = (mixed      /sum(mixed      )),
+                  other_p       = (other      /sum(other      ))) %>% 
+           select(LSOA21CD     , white_p    , indian_p, p_and_b_p, 
+                  afr_crb_oth_p, oth_asian_p, mixed_p , other_p  ) %>%
+           setNames(c("LSOA21CD"    , "etg_wht_2021", "etg_ind_2021", "etg_pnb_2021", 
+                      "etg_aco_2021", "etg_oas_2021", "etg_mxd_2021", "etg_otr_2021"))
+etg_all_2021 = c(etg_2021$etg_wht_2021,etg_2021$etg_ind_2021,etg_2021$etg_pnb_2021,etg_2021$etg_aco_2021,
+                 etg_2021$etg_oas_2021,etg_2021$etg_mxd_2021,etg_2021$etg_otr_2021)
+etg_2021 = etg_2021 %>%
+           mutate(etg_wht_2021 = etg_wht_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_ind_2021 = etg_ind_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_pnb_2021 = etg_pnb_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_aco_2021 = etg_aco_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_oas_2021 = etg_oas_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_mxd_2021 = etg_mxd_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )},
+                  etg_otr_2021 = etg_otr_2021 %>% {(. - mean(etg_all_2021 )) / sd(etg_all_2021 )})
+```
+
+
+
+# Merge 2011 and 2021 census results as harmonised dataset
+```{r}
+# Read in harmonised lookup table and merge with IMD data
+harm = read_csv(paste0(ghp,dp,lkp,"LSOAXXCD_lookup.csv")) %>% 
+       filter(CTRY22CD == "E92000001") %>% as.tibble() %>% 
+       left_join(pop_2011 %>% as.tibble()) %>% 
+       left_join(cob_2011 %>% as.tibble()) %>% 
+       left_join(etg_2011 %>% as.tibble()) %>% 
+       left_join(pop_2021 %>% as.tibble()) %>% 
+       left_join(cob_2021 %>% as.tibble()) %>% 
+       left_join(etg_2021 %>% as.tibble()) 
+
+# Save output
+harm %>% write_csv(paste0(ghp,dp,otp,plp,"harmonised_LSOA_data_Census_2011_2021.csv"))
+```
+
+
+
+# Average results by harmonised LSOA geographies
+```{r}
+# Function to create weighted mean for a specified population (y) based on specified population counts (x)
+wmn = function(df,lsoa,x,y) {
+  
+  # If values do not vary between LSOAs
+  if ((df[,y] %>% t() %>% as.vector() %>% unique() %>% length()) == 1) {
+    
+    # Apply no changes
+    df = df
+    
+  } else { # If values do vary between LSOAs
+    
+    # Create subsetted dataframe that is grouped by the relevent lsoa code
+    df_sub = df %>% select(all_of(lsoa),all_of(x),all_of(y)) %>% setNames(c("lsoa","x","y")) %>% 
+                    group_by(lsoa) %>% reframe(lsoa = unique(lsoa), x = unique(x), y = unique(y))
+    
+    # Convert population counts to weights (i.e. proportion of total population within area)
+    w = (df_sub[,"x"] %>% t() %>% as.vector() / sum(df_sub[,"x"] %>% t() %>% as.vector()))
+    
+    # Use weights to calculate weighted mean for specified variable
+    wm = weighted.mean(df_sub[,"y"] %>% t() %>% as.vector(), w)
+    
+    # Assign all LSOAs within super-LSOA population weighted mean
+    df[,y] = wm
+    
+  }
+  
+  # Return dataframe
+  return(df)
+}
+
+# Import harmonised data
+harm = read_csv(paste0(ghp,dp,otp,plp,"harmonised_LSOA_data_Census_2011_2021.csv"))
+
+# Define names of harmonised LSOAs with more than 1 geography across the 3 censuses
+super_lsoas = harm %>% group_by(LSOAXXCD) %>% summarise(n = n()) %>% arrange(desc(n)) %>% filter(n > 1) %>% .$LSOAXXCD
+
+# Filter for harmonised LSOAs with more than 1 geography across the 3 censuses,
+# then split into list of individual dataframes
+harm_avg = harm %>% filter(LSOAXXCD %in% super_lsoas) %>% group_split(LSOAXXCD)
+
+# Get weighted averages for Census 2011 using population counts from 2011 
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_ukb_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_eur_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_afr_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_mea_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_anc_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","cob_aoo_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_wht_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_ind_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_pnb_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_aco_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_oas_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_mxd_2011"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA11CD","pop_ttl_2011","etg_otr_2011"            ))
+# Get weighted averages for Census 2021 using population counts from 2021 
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_ukb_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_eur_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_afr_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_mea_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_anc_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","cob_aoo_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_wht_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_ind_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_pnb_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_aco_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_oas_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_mxd_2021"            ))
+harm_avg = harm_avg %>% map(~ wmn(.,"LSOA21CD","pop_ttl_2021","etg_otr_2021"            ))
+
+# Bind all rows back together and combine with non-super LSOAs
+harm_avg_all = harm_avg %>% bind_rows() %>% rbind(harm %>% filter(!(harm$LSOAXXCD %in% super_lsoas))) %>% arrange(LSOAXXCD)
+
+# Save output
+harm_avg_all %>% write_csv(paste0(ghp,dp,otp,"2011_2021_LSOA_Conational_and_Coethnic_Concentration.csv"))
+```
